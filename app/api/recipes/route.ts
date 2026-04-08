@@ -1,3 +1,53 @@
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+type GeminiListModelsResponse = {
+  models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>
+  nextPageToken?: string
+}
+
+function shortModelId(fullName: string): string {
+  return fullName.replace(/^models\//, "")
+}
+
+/** Lists model IDs that support generateContent (handles pagination). */
+async function listGenerateContentModelIds(apiKey: string): Promise<string[]> {
+  const ids: string[] = []
+  let pageToken: string | undefined
+
+  do {
+    const url = new URL(`${GEMINI_API_BASE}/models`)
+    url.searchParams.set("key", apiKey)
+    url.searchParams.set("pageSize", "100")
+    if (pageToken) url.searchParams.set("pageToken", pageToken)
+
+    const listResp = await fetch(url.toString())
+    if (!listResp.ok) {
+      console.error("[v0] ListModels failed", { status: listResp.status })
+      break
+    }
+
+    const data = (await listResp.json()) as GeminiListModelsResponse
+    for (const m of data.models ?? []) {
+      const methods = m.supportedGenerationMethods ?? []
+      if (!methods.includes("generateContent") || !m.name) continue
+      const id = shortModelId(m.name)
+      if (id.includes("embedding") || id.includes("tts") || id.includes("aqa")) continue
+      ids.push(id)
+    }
+    pageToken = data.nextPageToken
+  } while (pageToken)
+
+  return ids
+}
+
+function pickPreferredFlashModel(ids: string[]): string | undefined {
+  if (!ids.length) return undefined
+  const pool = ids.filter((id) => /flash/i.test(id))
+  const ranked = (pool.length ? pool : ids).slice()
+  ranked.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+  return ranked[0]
+}
+
 export async function POST(request: Request) {
   try {
     const { ingredients, apiKey } = await request.json()
@@ -33,11 +83,32 @@ Format your response as valid JSON array with this structure:
 
 Only return the JSON array, no other text.`
 
-    const configuredModel = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview"
+    const availableIds = await listGenerateContentModelIds(geminiApiKey)
+    const preferredAuto = pickPreferredFlashModel(availableIds)
+
+    const envPrimary = process.env.GEMINI_MODEL?.trim()
+    const envFallback = process.env.GEMINI_FALLBACK_MODEL?.trim()
+
+    const tryOrder: string[] = []
+    const push = (id: string | undefined) => {
+      if (id && !tryOrder.includes(id)) tryOrder.push(id)
+    }
+    push(envPrimary)
+    push(envFallback)
+    push(preferredAuto)
+    for (const id of availableIds) push(id)
+
+    if (tryOrder.length === 0) {
+      console.error("[v0] No generateContent models returned for this API key")
+      return Response.json(
+        { error: "No Gemini text models available for this API key" },
+        { status: 502 },
+      )
+    }
 
     async function callGemini(model: string) {
       return await fetch(
-        `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${geminiApiKey}`,
+        `${GEMINI_API_BASE}/models/${encodeURIComponent(model)}:generateContent?key=${geminiApiKey}`,
         {
           method: "POST",
           headers: {
@@ -58,44 +129,28 @@ Only return the JSON array, no other text.`
       )
     }
 
-    // Try the configured model first
-    let response = await callGemini(configuredModel)
+    let response: Response | null = null
+    let lastModelTried = ""
 
-    // If model not found, request the list of models to help debugging and optionally retry with a fallback
-    if (response.status === 404) {
-      // Collect upstream body for logs
-      let respBody: unknown
-      try {
-        respBody = await response.json()
-      } catch (e) {
+    for (const modelId of tryOrder) {
+      lastModelTried = modelId
+      response = await callGemini(modelId)
+      if (response.ok) break
+      if (response.status === 404) {
+        let body: unknown
         try {
-          respBody = await response.text()
-        } catch (e) {
-          respBody = '<unreadable response>'
+          body = await response.clone().json()
+        } catch {
+          body = await response.clone().text().catch(() => null)
         }
+        console.error("[v0] Gemini model unavailable, trying next", { modelId, body })
+        continue
       }
+      break
+    }
 
-      console.error('[v0] Gemini API error', {
-        status: response.status,
-        statusText: response.statusText,
-        body: respBody,
-        attemptedModel: configuredModel,
-      })
-
-      // Try to list available models for debugging (log only)
-      try {
-        const listResp = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${geminiApiKey}`)
-        const listData = await listResp.json()
-        console.error('[v0] Gemini available models', { listData })
-      } catch (e) {
-        console.error('[v0] Failed to list Gemini models', e)
-      }
-
-      const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || "gemini-1.5-flash"
-      if (fallbackModel && fallbackModel !== configuredModel) {
-        console.error('[v0] Retrying with fallback model', { fallbackModel })
-        response = await callGemini(fallbackModel)
-      }
+    if (!response) {
+      return Response.json({ error: "Failed to reach Gemini" }, { status: 502 })
     }
 
     if (!response.ok) {
@@ -111,10 +166,11 @@ Only return the JSON array, no other text.`
         }
       }
 
-      console.error('[v0] Gemini API error', {
+      console.error("[v0] Gemini API error", {
         status: response.status,
         statusText: response.statusText,
         body: respBody,
+        lastModelTried,
       })
 
       // Return an explicit upstream error so callers can distinguish
