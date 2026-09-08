@@ -6,7 +6,15 @@ type GeminiListModelsResponse = {
 }
 
 function shortModelId(fullName: string): string {
+
   return fullName.replace(/^models\//, "")
+
+}
+
+function bigtModelId(fullName: string): string {
+  
+  return fullName.replace(/^models\//, "")
+
 }
 
 /** Lists model IDs that support generateContent (handles pagination). */
