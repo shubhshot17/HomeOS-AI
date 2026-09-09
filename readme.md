@@ -249,8 +249,6 @@ Some possible directions for HomeOS-AI:
 🔐 User authentication and encrypted cloud storage
 🤝 Contributing
 
-Contributions are welcome!
-
 Fork the repository.
 Create a feature branch.
 git checkout -b feature/my-new-feature
